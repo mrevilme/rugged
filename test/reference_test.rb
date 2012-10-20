@@ -16,13 +16,13 @@ context "Rugged::Reference stuff" do
 
   test "can list references" do
     refs = @repo.refs.map { |r| r.name.gsub("refs/", '') }.sort.join(':')
-    assert_equal "heads/master:heads/packed:tags/v0.9:tags/v1.0", refs
+    assert_equal "heads/master:heads/new-file:heads/packed:tags/v0.9:tags/v1.0", refs
   end
 
   test "can list references with non 7-bit ASCII characters" do
     Rugged::Reference.create(@repo, "refs/heads/#{UNICODE_REF_NAME}", "refs/heads/master")
     refs = @repo.refs.map { |r| r.name.gsub("refs/", '') }.sort.join(':')
-    assert_equal "heads/#{UNICODE_REF_NAME}:heads/master:heads/packed:tags/v0.9:tags/v1.0", refs
+    assert_equal "heads/#{UNICODE_REF_NAME}:heads/master:heads/new-file:heads/packed:tags/v0.9:tags/v1.0", refs
   end
 
   test "can list filtered references from regex" do
@@ -63,6 +63,13 @@ context "Rugged::Reference stuff" do
 
     exists = Rugged::Reference.exist?(@repo, "lol/wut")
     assert !exists
+  end
+
+  test "recognises valid/invalid reference names" do
+    assert Rugged::Reference.valid?("refs/heads/master")
+    assert Rugged::Reference.valid?("HEAD")
+    assert Rugged::Reference.valid?("refs/heads/n0n3x15t4nt") # Only syntax check
+    assert !Rugged::Reference.valid?("5b5b025afb0b4c913b4c338a42934a3863bf3644") # Commits are no valid reference *names*
   end
 
   test "can open packed reference" do

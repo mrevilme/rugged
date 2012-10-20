@@ -28,6 +28,7 @@ extern VALUE rb_mRugged;
 extern VALUE rb_cRuggedIndex;
 extern VALUE rb_cRuggedConfig;
 extern VALUE rb_cRuggedBackend;
+extern VALUE rb_cRuggedObject;
 
 VALUE rb_cRuggedRepo;
 VALUE rb_cRuggedOdbObject;
@@ -126,6 +127,51 @@ void rb_git_repo__free(git_repository *repo)
 	git_repository_free(repo);
 }
 
+/* Helper function used by the checkout_* methods to parse the argument hash.
+ * Takes the hash (ruby_opts) and a git_checkout_opts struct to fill with the results
+ * of the parsing process. */
+static void rb_git__parse_checkout_options(const VALUE* ruby_opts, git_checkout_opts* p_opts)
+{
+	VALUE opts_strategy;
+	VALUE opts_disable_filters;
+	VALUE opts_dir_mode;
+	VALUE opts_file_mode;
+	VALUE opts_file_open_flags;
+
+	/* Ensure we have a clean slate to work from */
+	memset(p_opts, 0, sizeof(*p_opts));
+
+	opts_strategy        = rb_hash_aref(*ruby_opts, ID2SYM(rb_intern("strategy")));
+	opts_disable_filters = rb_hash_aref(*ruby_opts, ID2SYM(rb_intern("disable_filters")));
+	opts_dir_mode        = rb_hash_aref(*ruby_opts, ID2SYM(rb_intern("dir_mode")));
+	opts_file_mode       = rb_hash_aref(*ruby_opts, ID2SYM(rb_intern("file_mode")));
+	opts_file_open_flags = rb_hash_aref(*ruby_opts, ID2SYM(rb_intern("file_open_flags")));
+
+	/* Convert the Ruby hash values to C stuff */
+	if (RTEST(opts_disable_filters))
+		p_opts->disable_filters = 1; /* boolean */
+	if (TYPE(opts_dir_mode) == T_FIXNUM)
+		p_opts->dir_mode = FIX2INT(opts_dir_mode);
+	if (TYPE(opts_file_mode) == T_FIXNUM)
+		p_opts->file_mode = FIX2INT(opts_file_mode);
+	if (TYPE(opts_file_open_flags) == T_FIXNUM)
+		p_opts->file_open_flags = FIX2INT(opts_file_open_flags);
+
+	if (TYPE(opts_strategy) == T_ARRAY){
+		p_opts->checkout_strategy = 0;
+
+		/* Now OR-in all requested flags */
+		if (rb_ary_includes(opts_strategy, ID2SYM(rb_intern("default"))))
+			p_opts->checkout_strategy |= GIT_CHECKOUT_DEFAULT;
+		if (rb_ary_includes(opts_strategy, ID2SYM(rb_intern("overwrite_modified"))))
+			p_opts->checkout_strategy |= GIT_CHECKOUT_OVERWRITE_MODIFIED;
+		if (rb_ary_includes(opts_strategy, ID2SYM(rb_intern("create_missing"))))
+			p_opts->checkout_strategy |= GIT_CHECKOUT_CREATE_MISSING;
+		if (rb_ary_includes(opts_strategy, ID2SYM(rb_intern("remove_untracked"))))
+			p_opts->checkout_strategy |=	GIT_CHECKOUT_REMOVE_UNTRACKED;
+	}
+}
+
 static VALUE rugged_repo_new(VALUE klass, git_repository *repo)
 {
 	VALUE rb_repo = Data_Wrap_Struct(klass, NULL, &rb_git_repo__free, repo);
@@ -144,7 +190,7 @@ static VALUE rugged_repo_new(VALUE klass, git_repository *repo)
 
 /*
  *	call-seq:
- *		Rugged::Repository.new(path) -> repository
+ *		new(path) -> repository
  *
  *	Open a Git repository in the given +path+ and return a +Repository+ object
  *	representing it. An exception will be thrown if +path+ doesn't point to a
@@ -172,7 +218,7 @@ static VALUE rb_git_repo_new(VALUE klass, VALUE rb_path)
 
 /*
  *	call-seq:
- *		Rugged::Repository.init_at(path, is_bare) -> repository
+ *		init_at(path, is_bare) -> repository
  *
  *	Initialize a Git repository in +path+. This implies creating all the
  *	necessary files on the FS, or re-initializing an already existing
@@ -197,6 +243,145 @@ static VALUE rb_git_repo_init_at(VALUE klass, VALUE path, VALUE rb_is_bare)
 	rugged_exception_check(error);
 
 	return rugged_repo_new(klass, repo);
+}
+
+/* Helper struct used to pass information to
+ * the nonblocking clone functions. The parameters are those
+ * required for the libgit2 clone functions; p_opts is not
+ * used for bare cloning. */
+struct _clone_params {
+	git_repository** pp_repo;	 /* This will get assigned the cloned repo object */
+	git_checkout_opts* p_opts; /* Options for the checkout after the clone (if not bare) */
+	char* url;                 /* URL of the remote host with protocol prefix */
+	char* target_path;         /* path where to clone to */
+
+	/* This value will automatically be set by the nonblocking
+	 * cloning functions. Setting it is meaningless, but after
+	 * rb_thread_blocking_region returns this is set to the
+	 * return value of the git_clone* functions. */
+	int git_error;
+};
+
+/* Runs the git-clone operation without the GVL. `params' is a pointer
+ * to a _clone_params struct. Called by rb_git_repo_clone(). */
+static VALUE rb_git_repo__nonblocking_clone(void* p_params)
+{
+	struct _clone_params* p_clone_params = (struct _clone_params*) p_params;
+	int error;
+
+	error = git_clone(	p_clone_params->pp_repo,
+											p_clone_params->url,
+											p_clone_params->target_path,
+											NULL, /* Can't call back to Ruby for fetch stats without dirty hacks */
+											NULL, /* Can't call back to Ruby for checkout stats without dirty hacks */
+											p_clone_params->p_opts);
+	p_clone_params->git_error = error;
+
+	return Qnil;
+}
+
+/* Runs the git-clone --bare operation without the GVL. `params' is a pointer
+ * to a _clone_params struct. Called by rb_git_repo_clone(). */
+static VALUE rb_git_repo__nonblocking_clone_bare(void* p_params)
+{
+	struct _clone_params* p_clone_params = (struct _clone_params*) p_params;
+	int error;
+
+	error = git_clone_bare(	p_clone_params->pp_repo,
+													p_clone_params->url,
+													p_clone_params->target_path,
+													NULL);
+	p_clone_params->git_error = error;
+
+	return Qnil;
+}
+
+/* Currently libgit2 has no way to abort a running clone
+ * operation. If one is added, this function should be
+ * adjusted apropriately. `p_param' is a pointer to
+ * a _clone_params struct (but beware; depending on the
+ * abortion time, the pp_repo parameter may not be fully
+ * initialised). Called by rb_git_repo_clone(). */
+static void rb_git_repo__abort_clone(void* p_param)
+{
+	/* struct _clone_params* p_repo = (struct _clone_params*) p_param; */
+	return; /* Yes, this currently DOES NOTHING. See comments above. */
+}
+
+/*
+ *	call-seq:
+ *		clone_repo(url, target_path [, opts = {} ]) -> repository
+ *
+ *	Clone a Git repository from the remote at +url+ into the given
+ *	local +target_path+ and return a Repository object pointing to
+ *	the freshly cloned repository's <tt>.git</tt> directory.
+ *
+ *	After the cloning has completed, Rugged immediately checks out the branch
+ *	pointed to by the remote HEAD. To suppress this, you can add the option
+ *	<tt>:bare</tt> to the +opts+ hash, which (as the name indicates)
+ *	will cause a bare repository to be created. Other than that,
+ *	+opts+ will be passed on to the checkout operation, so see
+ *	#checkout_index for possible values you can assign to +opts+.
+ *
+ *	This method releases the GVL during the clone operation.
+ *
+ *		Rugged::Repository.clone_repo("git://github.com/libgit2/libgit2.git", "~/libgit2")
+ *		Rugged::Repository.clone_repo("git://github.com/libgit2/libgit2.git", "~/libgit2.git", bare: true)
+ */
+static VALUE rb_git_repo_clone(int argc, VALUE argv[], VALUE self)
+{
+	VALUE url;
+	VALUE target_path;
+	VALUE ruby_opts;
+	git_repository *p_repo;
+	struct _clone_params clone_params;
+
+	rb_scan_args(argc, argv, "21", &url, &target_path, &ruby_opts);
+	if (TYPE(ruby_opts) != T_HASH)
+		ruby_opts = rb_hash_new(); /* Assume empty hash if none given */
+
+	clone_params.pp_repo		 = &p_repo;
+	clone_params.url				 = StringValueCStr(url);
+	clone_params.target_path = StringValueCStr(target_path);
+
+	if (RTEST(rb_hash_aref(ruby_opts, ID2SYM(rb_intern("bare"))))) {
+		clone_params.p_opts = NULL; /* Not required for bare clone */
+
+#ifdef USING_RUBY_19
+		rb_thread_blocking_region(	rb_git_repo__nonblocking_clone_bare,
+																&clone_params,
+																rb_git_repo__abort_clone,
+																&clone_params);
+#else
+		/* Poor 1.8 guys, you cannot have concurrency */
+		rb_git_repo__nonblocking_clone_bare(&clone_params);
+#endif
+  }
+  else {
+		/* Clone the options hash, so we can safely remove :bare from
+		 * it in order to pass it on to the checkout operation. */
+		VALUE checkout_opts = rb_obj_dup(ruby_opts);
+		rb_hash_delete(checkout_opts, ID2SYM(rb_intern("bare")));
+
+		/* Parse the checkout options */
+		git_checkout_opts opts;
+		rb_git__parse_checkout_options(&ruby_opts, &opts);
+		clone_params.p_opts = &opts;
+
+#ifdef USING_RUBY_19
+		rb_thread_blocking_region(	rb_git_repo__nonblocking_clone,
+																&clone_params,
+																rb_git_repo__abort_clone,
+																&clone_params);
+#else
+		/* Poor 1.8 guys, you cannot have concurrency */
+		rb_git_repo__nonblocking_clone(&clone_params);
+#endif
+	}
+
+	rugged_exception_check(clone_params.git_error);
+
+	return rugged_repo_new(self, p_repo);
 }
 
 #define RB_GIT_REPO_OWNED_GET(_klass, _object) \
@@ -541,6 +726,138 @@ static VALUE rb_git_repo_set_workdir(VALUE self, VALUE rb_workdir)
 }
 
 /*
+ * call-seq:
+ *   repo.checkout_index( [ opts = {} ] )
+ *
+ * Writes the files in the index ("staging area") out to the working
+ * tree. Does not update the HEAD pointer.
+ *
+ * +opts+ is a hash which can take the following values:
+ * [:strategy (<tt>[:default]</tt>)]
+ *   Defines how to exactly check out the given +treeish+. This is an
+ *   array containing one or more of the following symbols:
+ *   [:default]            Don't overwrite anything.
+ *   [:overwrite_modified] Overwrite files already there.
+ *   [:create_missing]     If a file is in the index, but not in the worktree, copy it nevertheless to the work tree.
+ *   [:remove_untracked]   Delete files from the working tree not checked into Git.
+ * [:disable_filters (0)]
+ *   Not documented by libgit2.
+ * [:dir_mode (0755)]
+ *   Not documented by libgit2.
+ * [:file_mode (0664)]
+ *   Not documented by libgit2.
+ * [:file_open_flags (<tt>IO::CREAT | IO::TRUNC | IO::WRONLY</tt>)]
+ *   Not documented by libgit2.
+ */
+static VALUE rb_git_repo_checkout_index(int argc, VALUE argv[], VALUE self)
+{
+  VALUE ruby_opts;
+  git_repository *repo;
+  int error;
+  git_checkout_opts opts;
+
+  Data_Get_Struct(self, git_repository, repo);
+
+  /* Grab the options hash */
+  rb_scan_args(argc, argv, "01", &ruby_opts);
+  if (TYPE(ruby_opts) != T_HASH)
+    ruby_opts = rb_hash_new(); /* If not passed, assume an empty hash */
+
+  /* Parse the wealth of options and collect the results in `opts' */
+  rb_git__parse_checkout_options(&ruby_opts, &opts);
+
+  /* Checkout operation */
+  error = git_checkout_index(repo, &opts, NULL); /* TODO: Progress access for block */
+  rugged_exception_check(error);
+
+  return Qnil;
+}
+
+/*
+ * call-seq:
+ *   repo.checkout_head( [ opts = {} ] )
+ *
+ * Updates files in the index and the working tree to match the commit pointed
+ * at by HEAD.
+ *
+ * See #checkout_index for a description of the values you can assign
+ * to +opts+.
+ */
+static VALUE rb_git_repo_checkout_head(int argc, VALUE argv[], VALUE self)
+{
+  VALUE ruby_opts;
+  git_repository *repo;
+  int error;
+  git_checkout_opts opts;
+
+  Data_Get_Struct(self, git_repository, repo);
+
+  /* Grab the options hash */
+  rb_scan_args(argc, argv, "01", &ruby_opts);
+  if (TYPE(ruby_opts) != T_HASH)
+    ruby_opts = rb_hash_new(); /* If not passed, assume an empty hash */
+
+  /* Parse the wealth of options and collect the results in `opts' */
+  rb_git__parse_checkout_options(&ruby_opts, &opts);
+
+  /* Checkout operation */
+  error = git_checkout_head(repo, &opts, NULL); /* TODO: Progress access for block */
+  rugged_exception_check(error);
+
+  return Qnil;
+}
+
+/*
+ * call-seq:
+ *   repo.checkout_tree(treeish [, opts = {}])
+ *
+ * Reads the tree pointed to by +treeish+ into the index and
+ * writes the index out to the working tree afterwards. Note this method
+ * does *not* update the HEAD pointer, so you probably want to do this
+ * afterwards:
+ *
+ *   # Checkout the branch "yourbranch"
+ *   ref = Rugged::Reference.new(repo, "refs/heads/yourbranch")
+ *   commit = Rugged::Commit.lookup(repo, ref.target)
+ *   repo.checkout_tree(commit, strategy: [:overwrite_modified, :create_missing, :remove_untracked])
+ *
+ *   # Update the HEAD pointer to point to "yourbranch"
+ *   head = Rugged::Reference.lookup(repo, "HEAD")
+ *   head.target = ref.name
+ *
+ * See #checkout_index for the values you can pass via +opts+. +treeish+ may be
+ * a real Tree instance, a Commit or a Tag object.
+ */
+static VALUE rb_git_repo_checkout_tree(VALUE argc, VALUE argv[], VALUE self)
+{ /* NOTE: Checking out a tree is the same as pushing a tree onto the index (read-tree) and then checking out the index (checkout-index) */
+  VALUE target;
+  VALUE ruby_opts;
+  git_repository *repo;
+  int error;
+  git_object *treeish;
+  git_checkout_opts opts;
+
+  Data_Get_Struct(self, git_repository, repo);
+
+  /* Grab the options hash */
+  rb_scan_args(argc, argv, "11", &target, &ruby_opts);
+  if (TYPE(ruby_opts) != T_HASH)
+    ruby_opts = rb_hash_new(); /* If not passed, assume an empty hash */
+
+  if (!rb_obj_is_kind_of(target, rb_cRuggedObject))
+    rb_raise(rb_eTypeError, "Expected argument #1 to be a Rugged::Object (a commit, a tag or a tree)!");
+  Data_Get_Struct(target, git_object, treeish);
+
+  /* Parse the wealth of options and collect the results in `opts' */
+  rb_git__parse_checkout_options(&ruby_opts, &opts);
+
+  /* Update the index */
+  error = git_checkout_tree(repo, treeish, &opts, NULL); /* TODO: Progress access for block */
+  rugged_exception_check(error);
+  return Qnil;
+}
+
+/*
  *	call-seq:
  *		Repository.discover(path = nil, across_fs = true) -> repository
  *
@@ -696,6 +1013,7 @@ void Init_rugged_repo()
 	rb_define_singleton_method(rb_cRuggedRepo, "hash",   rb_git_repo_hash,  2);
 	rb_define_singleton_method(rb_cRuggedRepo, "hash_file",   rb_git_repo_hashfile,  2);
 	rb_define_singleton_method(rb_cRuggedRepo, "init_at", rb_git_repo_init_at, 2);
+	rb_define_singleton_method(rb_cRuggedRepo, "clone_repo", rb_git_repo_clone, -1); /* Cannot name it ::clone b/c Ruby already has a method with this name */
 	rb_define_singleton_method(rb_cRuggedRepo, "discover", rb_git_repo_discover, -1);
 
 	rb_define_method(rb_cRuggedRepo, "exists?", rb_git_repo_exists, 1);
@@ -718,6 +1036,10 @@ void Init_rugged_repo()
 
 	rb_define_method(rb_cRuggedRepo, "head_detached?",  rb_git_repo_head_detached,  0);
 	rb_define_method(rb_cRuggedRepo, "head_orphan?",  rb_git_repo_head_orphan,  0);
+
+	rb_define_method(rb_cRuggedRepo, "checkout_index", rb_git_repo_checkout_index, -1);
+	rb_define_method(rb_cRuggedRepo, "checkout_head", rb_git_repo_checkout_head, -1);
+	rb_define_method(rb_cRuggedRepo, "checkout_tree", rb_git_repo_checkout_tree, -1);
 
 	rb_cRuggedOdbObject = rb_define_class_under(rb_mRugged, "OdbObject", rb_cObject);
 	rb_define_method(rb_cRuggedOdbObject, "data",  rb_git_odbobj_data,  0);

@@ -3,7 +3,7 @@ require 'base64'
 
 context "Rugged::Repository stuff" do
   setup do
-    @path = File.dirname(__FILE__) + '/fixtures/testrepo.git/'
+    @path = test_repo_path("testrepo.git")
     @repo = Rugged::Repository.new(@path)
 
     @test_content = "my test data\n"
@@ -88,20 +88,20 @@ context "Rugged::Repository stuff" do
   test "can return all refs" do
     refs = @repo.refs
 
-    assert_equal 4, refs.length
+    assert_equal 5, refs.length
   end
 
   test "can return all refs that match" do
     refs = @repo.refs 'refs/heads'
 
-    assert_equal 2, refs.length
+    assert_equal 3, refs.length
   end
 
   test "can return the names of all refs" do
     refs = @repo.ref_names
 
     refs.each {|name| assert name.kind_of?(String)}
-    assert_equal 4, refs.count
+    assert_equal 5, refs.count
   end
 
   test "can return all tags" do
@@ -137,6 +137,95 @@ context "Rugged::Repository stuff" do
   test "garbage collection methods don't crash" do
     Rugged::Repository.new(@path)
     ObjectSpace.garbage_collect
+  end
+
+  test "can successfully clone a repository" do
+    # Remote clone
+    tmpdir = Dir.mktmpdir("clone-target-dir")
+    begin
+      repo = Rugged::Repository.clone_repo("git://github.com/libgit2/libgit2.git", tmpdir)
+      assert_kind_of Rugged::Commit, repo.lookup("1a628100534a315bd00361fc3d32df671923c107")
+    ensure
+      FileUtils.rm_rf(tmpdir)
+    end
+
+    # Bare repository
+    tmpdir = Dir.mktmpdir("clone-target-dir")
+    begin
+      repo = Rugged::Repository.clone_repo("git://github.com/libgit2/libgit2.git", tmpdir, :bare => true)
+      assert_kind_of Rugged::Commit, repo.lookup("1a628100534a315bd00361fc3d32df671923c107")
+    ensure
+      FileUtils.rm_rf(tmpdir)
+    end
+
+    # Local clone
+    skip "libgit2 currently doesn't support the file:// protocol." # Remove this when libgit2 adds file://.
+    tmpdir = Dir.mktmpdir("clone-target-dir")
+    begin
+      repo = Rugged::Repository.clone_repo("file://#@path", tmpdir)
+      assert_equal "36060c58702ed4c2a40832c51758d5344201d89a", repo.last_commit.oid
+      assert_kind_of Rugged::Commit repo.lookup("8496071c1b46c854b31185ea97743be6a8774479")
+
+      refs = repo.refs
+      assert_equal 4, refs.length
+    ensure
+      FileUtils.rm_rf(tmpdir)
+    end
+  end
+end
+
+context "Repository checkouts" do
+
+  setup do
+    @repo_path             = temp_repo("testrepo.git")
+    `cd '#@repo_path' && git branch new-file refs/remotes/origin/new-file` # checkout doesn't do tracking (without this, we cannot checkout a remote branch however)
+    @repo                  = Rugged::Repository.new(@repo_path)
+    @path_to_branched_file = File.join(@repo_path, "another_file.txt") # This file only exists in the new-file branch
+    @path_to_other_file    = File.join(@repo_path, "stuff")            # This file doesn't exist in any branch
+    @last_master_commit    = Rugged::Commit.lookup(@repo, Rugged::Reference.lookup(@repo, "refs/heads/master").target)
+    @last_new_file_commit  = Rugged::Commit.lookup(@repo, Rugged::Reference.lookup(@repo, "refs/heads/new-file").target)
+  end
+
+  test "can checkout back and fourth" do
+    File.open(@path_to_other_file, "w"){|f| f.write("more stuff")}
+    assert !File.file?(@path_to_branched_file)
+
+    @repo.checkout_tree(@last_new_file_commit, :strategy => [:default, :overwrite_modified, :create_missing, :remove_untracked])
+    assert File.file?(@path_to_branched_file)
+    assert !File.file?(@path_to_other_file) # :remove_untracked
+
+    @repo.checkout_tree(@last_master_commit, :strategy => [:default, :overwrite_modified, :create_missing, :remove_untracked])
+    assert !File.file?(@path_to_branched_file)
+
+    @repo.checkout_tree(@last_new_file_commit, :strategy => [:default, :overwrite_modified, :remove_untracked])
+    assert !File.file?(@path_to_branched_file) # :create_missing ommited
+    @repo.checkout_tree(@last_master_commit, :strategy => [:default, :overwrite_modified, :create_missing, :remove_untracked])
+
+    File.open(@path_to_other_file, "w"){|f| f.write("more stuff")}
+    @repo.checkout_tree(@last_new_file_commit, :strategy => [:default, :overwrite_modified])
+    assert File.file?(@path_to_other_file) # :remove_untracked ommited
+
+    File.open(@path_to_branched_file, "w"){|f| f.write("Modified this file.")}
+    @repo.checkout_tree(@last_master_commit, :strategy => [:default, :create_missing])
+    assert_equal("Modified this file.", File.read(@path_to_branched_file)) # :overwrite_modified ommited
+
+    assert_nil @repo.checkout_tree(@last_new_file_commit)
+  end
+
+  test "can checkout the index" do
+    # Read the new-file branch's latest commit's tree into the index, then check
+    # it out removing anything not related to that tree.
+    assert !File.file?(@path_to_branched_file)
+    `cd '#@repo_path' && git read-tree #{@last_new_file_commit.tree_oid}`
+    assert_nil @repo.checkout_index(:strategy => [:default, :overwrite_modified, :create_missing, :remove_untracked])
+    assert File.file?(@path_to_branched_file)
+  end
+
+  test "can checkout the HEAD" do
+    File.open(@path_to_other_file, "w"){|f| f.write("This stuff is to be discarded.")}
+    # Now reset the working direcory
+    assert_nil @repo.checkout_head(:strategy => [:default, :remove_untracked])
+    assert !File.file?(@path_to_other_file)
   end
 
 end
